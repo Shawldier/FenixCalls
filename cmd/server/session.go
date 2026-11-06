@@ -112,6 +112,10 @@ type Session struct {
 	// chegam em goroutines separadas e criariam contatos/conversas duplicados no
 	// Chatwoot se rodassem ensureContact/ensureConversation concorrentemente.
 	importMu sync.Mutex
+	// importWindow: quando definida (import sob demanda com since/until), o import
+	// de histórico só posta mensagens dentro da janela e fora de skip (as que já
+	// conhecíamos, logo já entregues ao Chatwoot). Expira sozinha.
+	importWindow atomic.Pointer[importWindow]
 
 	// Chamada em GRUPO (experimental, atrás da flag WACALLS_GROUP_CALLS). Criado sob
 	// demanda. Protegido por s.mu.

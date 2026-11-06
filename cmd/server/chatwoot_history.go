@@ -40,6 +40,11 @@ func (s *server) handleImportHistoryNow(w http.ResponseWriter, r *http.Request) 
 		Count    int    `json:"count"`
 		Chat     string `json:"chat"`
 		MaxChats int    `json:"maxChats"`
+		// Since/Until (epoch s): preenche um BURACO (sessão desconectada). A âncora de
+		// cada chat passa a ser a 1ª msg depois de Until, e só entram mensagens da
+		// janela que ainda não conhecíamos.
+		Since int64 `json:"since"`
+		Until int64 `json:"until"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&b)
 	count := b.Count
@@ -67,7 +72,19 @@ func (s *server) handleImportHistoryNow(w http.ResponseWriter, r *http.Request) 
 
 	// âncoras: um chat específico OU a msg mais antiga de cada chat 1:1
 	var anchors []anchorMessage
-	if strings.TrimSpace(b.Chat) != "" {
+	if b.Since > 0 && b.Until > b.Since {
+		if sess.mgr.store == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "sem armazenamento de mensagens"})
+			return
+		}
+		skip, err := sess.mgr.store.idsBetween(r.Context(), sess.id, b.Since*1000, b.Until*1000)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		sess.importWindow.Store(&importWindow{since: b.Since, until: b.Until, skip: skip, expires: time.Now().Add(importWindowTTL)})
+		anchors, _ = sess.mgr.store.firstAfterPerChat(r.Context(), sess.id, b.Until*1000, maxChats)
+	} else if strings.TrimSpace(b.Chat) != "" {
 		jid, err := resolveRecipient(b.Chat)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -137,6 +154,10 @@ func (s *Session) importHistorySync(data *waHistorySync.HistorySync) {
 		days = importHistoryMaxDays
 	}
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour).Unix()
+	win := s.activeImportWindow()
+	if win != nil && win.since < cutoff {
+		cutoff = win.since
+	}
 
 	// serializa os chunks do HistorySync (evita criar contato/conversa duplicados)
 	s.importMu.Lock()
@@ -144,7 +165,7 @@ func (s *Session) importHistorySync(data *waHistorySync.HistorySync) {
 
 	total := 0
 	for _, conv := range data.GetConversations() {
-		total += s.importConversation(cfg, conv, cutoff)
+		total += s.importConversation(cfg, conv, cutoff, win)
 	}
 	if total > 0 {
 		s.log.Info("chatwoot: histórico importado", "mensagens", total, "chunk", data.GetChunkOrder())
@@ -152,7 +173,7 @@ func (s *Session) importHistorySync(data *waHistorySync.HistorySync) {
 }
 
 // importConversation importa uma conversa 1:1. Devolve quantas mensagens postou.
-func (s *Session) importConversation(cfg ChatwootConfig, conv *waHistorySync.Conversation, cutoff int64) int {
+func (s *Session) importConversation(cfg ChatwootConfig, conv *waHistorySync.Conversation, cutoff int64, win *importWindow) int {
 	jid, err := types.ParseJID(conv.GetID())
 	if err != nil {
 		return 0
@@ -180,6 +201,9 @@ func (s *Session) importConversation(cfg ChatwootConfig, conv *waHistorySync.Con
 		}
 		ts := wmi.GetMessageTimestamp()
 		if int64(ts) < cutoff {
+			continue
+		}
+		if win != nil && !win.wants(int64(ts), wmi.GetKey().GetID()) {
 			continue
 		}
 		msg := wmi.GetMessage()
@@ -272,4 +296,31 @@ func (s *Session) importMessage(cfg ChatwootConfig, convID int, msg *waE2E.Messa
 		return false
 	}
 	return true
+}
+
+// importWindowTTL: por quanto tempo a janela de um import "since/until" vale (as
+// respostas ON_DEMAND do WhatsApp chegam em segundos/minutos).
+const importWindowTTL = 30 * time.Minute
+
+type importWindow struct {
+	since, until int64 // epoch s
+	skip         map[string]struct{}
+	expires      time.Time
+}
+
+// wants diz se a msg (ts em epoch s) está na janela e ainda não era conhecida.
+func (w *importWindow) wants(ts int64, id string) bool {
+	if ts < w.since || ts > w.until {
+		return false
+	}
+	_, known := w.skip[id]
+	return !known
+}
+
+func (s *Session) activeImportWindow() *importWindow {
+	w := s.importWindow.Load()
+	if w == nil || time.Now().After(w.expires) {
+		return nil
+	}
+	return w
 }

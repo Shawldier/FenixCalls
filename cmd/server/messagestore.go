@@ -336,3 +336,50 @@ func (s *sessionStore) listChats(ctx context.Context, sessionID string, limit, o
 	}
 	return out, rows.Err()
 }
+
+// firstAfterPerChat devolve, por chat 1:1, a 1ª msg com ts > afterMs (âncora para
+// pedir ao WhatsApp as mensagens ANTERIORES a ela — preenche um buraco no meio).
+func (s *sessionStore) firstAfterPerChat(ctx context.Context, sessionID string, afterMs int64, limitChats int) ([]anchorMessage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT chat_jid, msg_id, ts, from_me FROM (
+			SELECT DISTINCT ON (chat_jid) chat_jid, msg_id, ts, from_me
+			FROM messages
+			WHERE session_id = $1 AND ts > $2
+			  AND chat_jid NOT LIKE '%@g.us'
+			  AND chat_jid NOT LIKE '%@newsletter'
+			  AND chat_jid NOT LIKE '%@broadcast'
+			ORDER BY chat_jid, ts ASC
+		) t
+		ORDER BY ts ASC LIMIT $3`, sessionID, afterMs, limitChats)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []anchorMessage{}
+	for rows.Next() {
+		var a anchorMessage
+		if err := rows.Scan(&a.ChatJID, &a.MsgID, &a.TS, &a.FromMe); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// idsBetween devolve os IDs de msg 1:1 já gravados no intervalo [fromMs, toMs].
+func (s *sessionStore) idsBetween(ctx context.Context, sessionID string, fromMs, toMs int64) (map[string]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT msg_id FROM messages WHERE session_id = $1 AND ts BETWEEN $2 AND $3`, sessionID, fromMs, toMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]struct{}{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = struct{}{}
+	}
+	return out, rows.Err()
+}
