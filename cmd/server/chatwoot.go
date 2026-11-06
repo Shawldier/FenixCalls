@@ -363,6 +363,7 @@ func (s *Session) chatwootMirrorOwnTitled(cfg ChatwootConfig, evt *events.Messag
 	}
 	avatar := s.cachedAvatar(chat)
 	j := deliverContent(evt, title, true)
+	j.Quiet = title == mirrorAPITitle
 	j.ChatID = chatID
 	j.Phone = phone
 	j.AltID = altID
@@ -526,6 +527,10 @@ type cwJob struct {
 	MsgRaw    json.RawMessage `json:"msg,omitempty"`      // protojson da mensagem; presente só quando há mídia p/ re-baixar
 	Referral  map[string]any  `json:"referral,omitempty"` // origem de anúncio (CTWA); vira nota privada p/ o atendente
 	Attrs     map[string]any  `json:"attrs,omitempty"`    // content_attributes extras (ex.: wa_participant em grupo)
+	// Quiet: espelho da integração (mirror_api). Reaproveita a última conversa da
+	// caixa mesmo resolvida (sem reabrir) e, se não houver, cria já resolvida — o
+	// aviso fica no histórico sem abrir ticket na fila de atendimento.
+	Quiet bool `json:"quiet,omitempty"`
 }
 
 func (j cwJob) hasMedia() bool { return len(j.MsgRaw) > 0 }
@@ -623,7 +628,11 @@ func (s *Session) execChatwootJob(cfg ChatwootConfig, j cwJob) error {
 	if err != nil {
 		return fmt.Errorf("ensure contact: %w", err)
 	}
-	convID, err := cfg.ensureConversation(contactID, sourceID)
+	ensure := cfg.ensureConversation
+	if j.Quiet {
+		ensure = cfg.ensureConversationQuiet
+	}
+	convID, err := ensure(contactID, sourceID)
 	if err != nil {
 		return fmt.Errorf("ensure conversation: %w", err)
 	}
@@ -868,6 +877,37 @@ func (c ChatwootConfig) ensureConversation(contactID int, sourceID string) (int,
 	}
 	body := map[string]any{
 		"source_id": sourceID, "inbox_id": c.InboxID, "contact_id": contactID, "status": "open",
+	}
+	res, code, e := c.req(http.MethodPost, "/conversations", body)
+	if e != nil {
+		return 0, e
+	}
+	if code >= 300 {
+		return 0, fmt.Errorf("create conversation http %d", code)
+	}
+	return asInt(res["id"]), nil
+}
+
+// ensureConversationQuiet: a conversa mais recente do contato nesta caixa, em
+// qualquer status (não reabre a resolvida); sem nenhuma, cria uma já resolvida.
+func (c ChatwootConfig) ensureConversationQuiet(contactID int, sourceID string) (int, error) {
+	if res, code, e := c.req(http.MethodGet, fmt.Sprintf("/contacts/%d/conversations", contactID), nil); e == nil && code == 200 {
+		best, bestAt := 0, -1
+		for _, it := range asList(res["payload"]) {
+			m := asMap(it)
+			if asInt(m["inbox_id"]) != c.InboxID {
+				continue
+			}
+			if at := asInt(m["last_activity_at"]); at > bestAt {
+				best, bestAt = asInt(m["id"]), at
+			}
+		}
+		if best != 0 {
+			return best, nil
+		}
+	}
+	body := map[string]any{
+		"source_id": sourceID, "inbox_id": c.InboxID, "contact_id": contactID, "status": "resolved",
 	}
 	res, code, e := c.req(http.MethodPost, "/conversations", body)
 	if e != nil {
